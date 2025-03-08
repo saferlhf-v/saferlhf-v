@@ -2,6 +2,10 @@
 
 This project is built on top of the [align-anything](https://github.com/PKU-Alignment/align-anything) framework. We introduce new features through the Safe RLHF-V method, enhancing the safety and performance of RLHF multi-modal training.
 
+## Dataset
+
+We use the [BeaverTails-V](https://huggingface.co/datasets/saferlhf-v/BeaverTails-V) dataset for training, a multimodal dataset covering nine primary safety domains, designed to help visual language models detect safety risks and content violations effectively.
+
 ## Quick Start
 
 ### Easy Installation

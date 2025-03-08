@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+import contextlib
+import os
+import warnings
+from typing import Any, Callable, Literal
+
+import deepspeed
+import torch
+import torch.nn as nn
+from peft import LoraConfig, get_peft_model
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
+
+try:
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+except ImportError:
+    from transformers import is_deepspeed_zero3_enabled
+
+from safe_rlhf_v.models.model_registry import AnyModel, AnyModelForScore
+from safe_rlhf_v.utils.multi_process import is_main_process
+from safe_rlhf_v.utils.tools import namedtuple_to_dict
+
+
+DEFAULT_BOS_TOKEN: str = '<s>'
+DEFAULT_EOS_TOKEN: str = '</s>'
+DEFAULT_PAD_TOKEN: str = '<pad>'
+DEFAULT_UNK_TOKEN: str = '<unk>'
+
+
+# Reference: https://github.com/tatsu-lab/stanford_alpaca/blob/main/train.py
+def resize_tokenizer_embedding(tokenizer: PreTrainedTokenizerBase, model: PreTrainedModel) -> None:
+    """Resize tokenizer and embedding.
+
+    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+
+    def verify_vocabulary_embedding_sizes(
+        tokenizer: PreTrainedTokenizerBase,
+        model: PreTrainedModel,
+        format_message: Callable[[Any, Any], str],
+    ) -> None:
+        input_embeddings = model.get_input_embeddings()
+        if (
+            input_embeddings is not None
+            and input_embeddings.num_embeddings != len(tokenizer)
+            and is_main_process()
+        ):
+            warnings.warn(
+                format_message(len(tokenizer), input_embeddings.num_embeddings),
+                category=RuntimeWarning,
+                stacklevel=3,
+            )
+
+    def init_new_embeddings(
+        embeddings: nn.Embedding | nn.Linear | None,
+        new_num_embeddings: int,
+        num_new_embeddings: int,
+    ) -> None:
+        if embeddings is None:
+            return
+
+        params = [embeddings.weight, getattr(embeddings, 'bias', None)]
+        context = (
+            deepspeed.zero.GatheredParameters(params, modifier_rank=0)
+            if is_deepspeed_zero3_enabled()
+            else contextlib.nullcontext()
+        )
+        with context:
+            for param in params:
+                if param is None:
+                    continue
+                assert param.size(0) == new_num_embeddings
+                param_data = param.data
+                param_mean = param_data[:-num_new_embeddings].mean(dim=0, keepdim=True)
+                param_data[-num_new_embeddings:] = param_mean
+
+    verify_vocabulary_embedding_sizes(
+        tokenizer=tokenizer,
+        model=model,
+        format_message=(
+            'The tokenizer vocabulary size ({}) is different from '
+            'the model embedding size ({}) before resizing.'
+        ).format,
+    )
+
+    special_tokens_dict = {}
+    if tokenizer.pad_token is None:
+        special_tokens_dict['pad_token'] = DEFAULT_PAD_TOKEN
+
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    new_num_embeddings = len(tokenizer)
+
+    model.config.bos_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    if num_new_tokens > 0:
+        hf_device_map = getattr(model, 'hf_device_map', {})
+        devices = {
+            torch.device(device)
+            for device in hf_device_map.values()
+            if device not in {'cpu', 'disk'}
+        }
+        is_model_parallel = len(devices) > 1
+
+        if not is_model_parallel:
+            model.resize_token_embeddings(new_num_embeddings)
+            init_new_embeddings(
+                model.get_input_embeddings(),
+                new_num_embeddings=new_num_embeddings,
+                num_new_embeddings=num_new_tokens,
+            )
+            init_new_embeddings(
+                model.get_output_embeddings(),
+                new_num_embeddings=new_num_embeddings,
+                num_new_embeddings=num_new_tokens,
+            )
+
+    verify_vocabulary_embedding_sizes(
+        tokenizer=tokenizer,
+        model=model,
+        format_message=(
+            'The tokenizer vocabulary size ({}) is different from '
+            'the model embedding size ({}) after resizing.'
+        ).format,
+    )
+
+
+def load_pretrained_models(  # pylint: disable=too-many-arguments
+    model_name_or_path: str | os.PathLike,
+    model_max_length: int = 512,
+    padding_side: Literal['left', 'right'] = 'right',
+    auto_device_mapping: bool = False,
+    freeze_vision_tower: bool = True,
+    freeze_audio_tower: bool = True,
+    freeze_mm_proj: bool = True,
+    freeze_vision_proj: bool = True,
+    freeze_audio_proj: bool = True,
+    freeze_language_model: bool = False,
+    dtype: torch.dtype | str | None = torch.bfloat16,
+    *,
+    cache_dir: str | os.PathLike | None = None,
+    trust_remote_code: bool = False,
+    auto_model_args: tuple[Any, ...] = (),
+    auto_model_kwargs: dict[str, Any] | None = None,
+    auto_tokenizer_args: tuple[Any, ...] = (),
+    auto_tokenizer_kwargs: dict[str, Any] | None = None,
+    bnb_cfgs: dict[str, Any] | None = None,
+    lora_cfgs: dict[str, Any] | None = None,
+    is_reward_model: bool = False,
+    processor_kwargs: dict[str, Any] = {},
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load pre-trained model and tokenizer from a given path."""
+    model_name_or_path = os.path.expanduser(model_name_or_path)
+    any_model = AnyModelForScore if is_reward_model else AnyModel
+    cache_dir = os.path.expanduser(cache_dir) if cache_dir is not None else None
+    device_map = 'auto' if auto_device_mapping else None
+    if auto_model_kwargs is None:
+        auto_model_kwargs = {}
+    if auto_tokenizer_kwargs is None:
+        auto_tokenizer_kwargs = {}
+
+    if bnb_cfgs and lora_cfgs:
+        if bnb_cfgs.use_bnb:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=bnb_cfgs.load_in_4bit,
+                load_in_8bit=bnb_cfgs.load_in_8bit,
+                bnb_4bit_quant_type=bnb_cfgs.bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=bnb_cfgs.bnb_4bit_use_double_quant,
+                bnb_4bit_compute_dtype=bnb_cfgs.bnb_4bit_compute_dtype,
+            )
+        if lora_cfgs.use_lora:
+            lora_config = LoraConfig(
+                task_type=lora_cfgs.task_type,
+                inference_mode=lora_cfgs.inference_mode,
+                r=lora_cfgs.r,
+                lora_alpha=lora_cfgs.lora_alpha,
+                lora_dropout=lora_cfgs.lora_dropout,
+                target_modules=lora_cfgs.target_modules,
+            )
+        if bnb_cfgs.use_bnb and not lora_cfgs.use_lora:
+            raise ValueError(
+                'bnb only is not compatible with deepspeeed, try working with peft + bnb + deepspeed by setting lora_cfgs.use_lora = True'
+            )
+        if lora_cfgs.use_lora and not bnb_cfgs.use_bnb:
+            model = any_model.from_pretrained(
+                model_name_or_path,
+                *auto_model_args,
+                cache_dir=cache_dir,
+                device_map=device_map,
+                torch_dtype=dtype,
+                trust_remote_code=trust_remote_code,
+                **auto_model_kwargs,
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+        if lora_cfgs.use_lora and bnb_cfgs.use_bnb:
+            model = any_model.from_pretrained(
+                model_name_or_path,
+                *auto_model_args,
+                cache_dir=cache_dir,
+                device_map=device_map,
+                torch_dtype=dtype,
+                trust_remote_code=trust_remote_code,
+                **auto_model_kwargs,
+                quantization_config=quantization_config,
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+        if not lora_cfgs.use_lora and not bnb_cfgs.use_bnb:
+            model = any_model.from_pretrained(
+                model_name_or_path,
+                *auto_model_args,
+                cache_dir=cache_dir,
+                device_map=device_map,
+                torch_dtype=dtype,
+                trust_remote_code=trust_remote_code,
+                **auto_model_kwargs,
+            )
+    else:
+        model = any_model.from_pretrained(
+            model_name_or_path,
+            *auto_model_args,
+            cache_dir=cache_dir,
+            device_map=device_map,
+            torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            **auto_model_kwargs,
+        )
+
+    forbidden_modules = set()
+    if freeze_vision_tower:
+        forbidden_modules.add('vision_tower')
+    if freeze_audio_tower:
+        forbidden_modules.add('audio_tower')
+    # attribute name of llava
+    if freeze_mm_proj:
+        forbidden_modules.add('multi_modal_projector')
+    if freeze_vision_proj:
+        forbidden_modules.add('image_projector')
+    if freeze_audio_proj:
+        forbidden_modules.add('audio_projector')
+    if freeze_language_model:
+        forbidden_modules.add('language_model')
+    for name, param in model.named_parameters():
+        if any(forbidden_module in name for forbidden_module in forbidden_modules):
+            param.requires_grad_(False)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        *auto_tokenizer_args,
+        cache_dir=cache_dir,
+        model_max_length=model_max_length,
+        padding_side=padding_side,
+        trust_remote_code=trust_remote_code,
+        **auto_tokenizer_kwargs,
+    )
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_name_or_path, **namedtuple_to_dict(processor_kwargs),
+            min_pixels=256 * 14 * 14,
+            max_pixels=640 * 14 * 14,
+        )
+    except Exception:
+        processor = None
+
+    if processor and hasattr(processor, 'tokenizer'):
+        processor.tokenizer.padding_side = padding_side
+        resize_tokenizer_embedding(tokenizer=processor.tokenizer, model=model)
+        if hasattr(model, 'chat_template'):
+            processor.chat_template = model.chat_template
+        return model, processor.tokenizer, processor
+    else:
+        processor = None
+        resize_tokenizer_embedding(tokenizer=tokenizer, model=model)
+        if hasattr(model, 'chat_template'):
+            tokenizer.chat_template = model.chat_template
+        return model, tokenizer, processor

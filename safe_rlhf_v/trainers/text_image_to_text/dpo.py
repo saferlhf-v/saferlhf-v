@@ -1,0 +1,175 @@
+import argparse
+import os
+import sys
+
+import deepspeed
+import torch
+import torch.distributed
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM
+from transformers.integrations.deepspeed import HfDeepSpeedConfig
+
+from safe_rlhf_v.datasets.text_image_to_text.preference import PreferenceDataset
+from safe_rlhf_v.datasets.text_to_text.preference import PreferenceBatch
+from safe_rlhf_v.models.pretrained_model import load_pretrained_models
+from safe_rlhf_v.trainers.text_to_text.dpo import DPOTrainer as DPOtextTrainer
+from safe_rlhf_v.utils.multi_process import get_current_device
+from safe_rlhf_v.utils.tools import (
+    custom_cfgs_to_dict,
+    dict_to_namedtuple,
+    gather_log_probabilities,
+    read_cfgs,
+    seed_everything,
+    update_dict,
+    strip_pad,
+)
+
+
+class DPOTrainer(DPOtextTrainer):
+
+    def init_datasets(self) -> None:
+        """Initialize training and evaluation datasets."""
+        self.train_dataloader, self.eval_dataloader = self.get_dataloaders(
+            PreferenceDataset, PreferenceDataset
+        )
+
+    def init_models(self) -> None:
+        """Initialize model and tokenizer."""
+        if self.ds_train_cfgs['zero_optimization']['stage'] == 3:
+            self.dstchf_train = HfDeepSpeedConfig(self.ds_train_cfgs)
+        if self.ds_eval_cfgs['zero_optimization']['stage'] == 3:
+            self.dsechf_eval = HfDeepSpeedConfig(self.ds_eval_cfgs)
+        self.model, self.tokenizer, self.processor = load_pretrained_models(
+            self.cfgs.model_cfgs.model_name_or_path,
+            model_max_length=self.cfgs.model_cfgs.model_max_length,
+            padding_side='left',
+            trust_remote_code=self.cfgs.model_cfgs.trust_remote_code,
+            freeze_mm_proj=self.cfgs.train_cfgs.freeze_mm_proj,
+            freeze_vision_tower=self.cfgs.train_cfgs.freeze_vision_tower,
+            freeze_language_model=self.cfgs.train_cfgs.freeze_language_model,
+            processor_kwargs=self.cfgs.processor_kwargs,
+        )
+        self.tokenizer.model_max_length = self.cfgs.model_cfgs.model_max_length
+        self.reference_model, _, _ = load_pretrained_models(
+            self.cfgs.model_cfgs.model_name_or_path,
+            model_max_length=self.cfgs.model_cfgs.model_max_length,
+            padding_side='left',
+            trust_remote_code=self.cfgs.model_cfgs.trust_remote_code,
+            processor_kwargs=self.cfgs.processor_kwargs,
+        )
+
+    def compute_log_probs(
+        self,
+        model: AutoModelForCausalLM,
+        batch: PreferenceBatch,
+    ) -> torch.Tensor:
+        """Compute log probabilities of given sequences."""
+        logits = model(**self.infer_batch(batch)).logits
+        device = logits.device
+        input_ids = batch['input_ids']
+        batch_size = len(batch['meta_info']['response_lens'])
+        logprob_list = []
+        for idx in range(batch_size):
+            response_length = batch['meta_info']['response_lens'][idx]
+            raw_input_id = strip_pad(input_ids[idx], self.tokenizer.pad_token_id)
+            logit = logits[idx][-response_length:].unsqueeze(0)
+            input_id = raw_input_id[-response_length:].unsqueeze(0)
+            log_p = gather_log_probabilities(logit[:, :-1], input_id[:, 1:])
+            logprob_list.append(log_p.squeeze(0))
+        return torch.nn.utils.rnn.pad_sequence(
+            logprob_list, batch_first=True, padding_value=0.0
+        ).to(device)
+
+    def loss(
+        self,
+        batch: PreferenceBatch,
+    ) -> dict[str, torch.Tensor]:
+        """Loss function for the DPO algorithm."""
+        sequence_log_probs = self.compute_log_probs(
+            self.model.module,
+            batch,
+        )
+        (
+            better_sequence_log_probs,  # size = (B, L - 1)
+            worse_sequence_log_probs,  # size = (B, L - 1)
+        ) = sequence_log_probs.chunk(chunks=2, dim=0)
+
+        with torch.no_grad():
+            ref_sequence_log_probs = self.compute_log_probs(  # size = (2 * B, L - 1)
+                self.reference_model.module,
+                batch,
+            )
+            ref_better_sequence_log_probs, ref_worse_sequence_log_probs = (
+                ref_sequence_log_probs.chunk(chunks=2, dim=0)
+            )
+
+        losses = []
+        better_sample_rewards = []
+        worse_sample_rewards = []
+
+        batch_size = better_sequence_log_probs.size(0)
+        for i in range(batch_size):
+            better_log_prob = better_sequence_log_probs[i, :].sum(dim=-1)
+            worse_log_prob = worse_sequence_log_probs[i, :].sum(dim=-1)
+            ref_better_log_prob = ref_better_sequence_log_probs[i, :].sum(dim=-1)
+            ref_worse_log_prob = ref_worse_sequence_log_probs[i, :].sum(dim=-1)
+            better_log_ratio = better_log_prob - ref_better_log_prob
+            worse_log_ratio = worse_log_prob - ref_worse_log_prob
+
+            losses.append(
+                -F.logsigmoid(
+                    self.cfgs.train_cfgs.scale_coeff * (better_log_ratio - worse_log_ratio),
+                ),
+            )
+            better_sample_rewards.append(
+                self.cfgs.train_cfgs.scale_coeff * better_log_ratio.detach(),
+            )
+            worse_sample_rewards.append(self.cfgs.train_cfgs.scale_coeff * worse_log_ratio.detach())
+        loss = torch.stack(losses).mean()  # size = ()
+        better_sample_reward = torch.stack(better_sample_rewards)  # size = (B,)
+        worse_sample_reward = torch.stack(worse_sample_rewards)  # size = (B,)
+        reward = better_sample_reward + worse_sample_reward  # size = (B,)
+        reward_accuracy = (better_sample_reward > worse_sample_reward).float().mean()  # size = ()
+        reward_margin = better_sample_reward - worse_sample_reward  # size = (B,)
+
+        return {
+            'loss': loss,
+            'reward': reward,
+            'better_sample_reward': better_sample_reward,
+            'worse_sample_reward': worse_sample_reward,
+            'reward_accuracy': reward_accuracy,
+            'reward_margin': reward_margin,
+        }
+
+
+def main():
+    # setup distribution training
+    deepspeed.init_distributed()
+    current_device = get_current_device()
+    torch.cuda.set_device(current_device)
+
+    # read default configs from the yaml file
+    task = os.path.join('text_image_to_text', 'dpo')
+    dict_cfgs, ds_cfgs = read_cfgs(mode='train', task=task)
+
+    # get custom configs from command line
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    _, unparsed_args = parser.parse_known_args()
+    keys = [k[2:] for k in unparsed_args[1::2]]
+    values = list(unparsed_args[2::2])
+    unparsed_args = dict(zip(keys, values))
+    for k, v in unparsed_args.items():
+        dict_cfgs = update_dict(dict_cfgs, custom_cfgs_to_dict(k, v))
+
+    # setup training
+    cfgs = dict_to_namedtuple(dict_cfgs)
+    seed_everything(cfgs.train_cfgs.seed)
+
+    # finetune the model
+    trainer = DPOTrainer(cfgs=cfgs, ds_cfgs=ds_cfgs)
+    trainer.train()
+    trainer.save()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

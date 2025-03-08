@@ -1,3 +1,7 @@
+## Introduction
+
+This project is built on top of the [align-anything](https://github.com/PKU-Alignment/align-anything) framework. We introduce new features through the Safe RLHF-V method, enhancing the safety and performance of RLHF multi-modal training.
+
 ## Quick Start
 
 ### Easy Installation

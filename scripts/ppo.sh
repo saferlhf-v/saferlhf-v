@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 
-ACTOR_MODEL_NAME_OR_PATH="" # model path
-REWARD_MODEL_NAME_OR_PATH="" # trained reward model path
-CRITIC_MODEL_NAME_OR_PATH=""
+ACTOR_MODEL_NAME_OR_PATH="llava-hf/llava-1.5-7b-hf" # model path
+REWARD_MODEL_NAME_OR_PATH="../rm/llava-1.5-7b-hf" # trained reward model path
+CRITIC_MODEL_NAME_OR_PATH="../rm/llava-1.5-7b-hf"
 
-TRAIN_DATASETS=""
-TRAIN_TEMPLATE="" # dataset template
-TRAIN_NAME="" # subset the dataset
-TRAIN_SPLIT="" # split the dataset
+TRAIN_DATASETS="saferlhf-v/BeaverTails-V"
+TRAIN_TEMPLATE="RM_V" # dataset template
+TRAIN_NAME="animal_abuse" # subset the dataset
+TRAIN_SPLIT="train" # split the dataset
 
-PTX_DATASETS=""
-PTX_TEMPLATE="" # dataset template
-PTX_SPLIT="" # split the dataset
+PTX_DATASETS="PKU-Alignment/Align-Anything-TI2T-Instruction-100K"
+PTX_TEMPLATE="AA_TI2T" # dataset template
+PTX_SPLIT="train" # split the dataset
 
-OUTPUT_DIR="" # output dir
+OUTPUT_DIR="../output/ppo" # output dir
 
 # For wandb online logging
 export WANDB_API_KEY=""

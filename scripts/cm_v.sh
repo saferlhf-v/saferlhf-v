@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 
-MODEL_NAME_OR_PATH="" # model path
+MODEL_NAME_OR_PATH="llava-hf/llava-1.5-7b-hf" # model path
 
-TRAIN_DATASETS=""
-TRAIN_TEMPLATE="" # dataset template
-TRAIN_NAME="" # subset the dataset
-TRAIN_SPLIT="" # split the dataset
+TRAIN_DATASETS="saferlhf-v/BeaverTails-V"
+TRAIN_TEMPLATE="CM_V" # dataset template
+TRAIN_NAME="animal_abuse" # subset the dataset
+TRAIN_SPLIT="train" # split the dataset
 
-EVAL_DATASETS=""
-EVAL_TEMPLATE="" # dataset template
-EVAL_NAME="" # subset the dataset
-EVAL_SPLIT="" # split the dataset
+EVAL_DATASETS="saferlhf-v/BeaverTails-V"
+EVAL_TEMPLATE="CM_V" # dataset template
+EVAL_NAME="dangerous_behavior" # subset the dataset
+EVAL_SPLIT="evaluation" # split the dataset
 
-OUTPUT_DIR="" # output dir
+OUTPUT_DIR="../outputs/cm_v" # output dir
 
 # For wandb online logging
 export WANDB_API_KEY=""
